@@ -1,10 +1,23 @@
 const express = require('express');
 const { TwitterApi } = require('twitter-api-v2');
+const Anthropic = require('@anthropic-ai/sdk');
 const cors = require('cors');
 const path = require('path');
 const https = require('https');
 const http = require('http');
 require('dotenv').config();
+
+// Initialize Anthropic client (support both key names)
+const anthropicKey = process.env.ANTHROPIC_KEY || process.env.ANTHROPIC_API_KEY;
+const anthropic = anthropicKey 
+  ? new Anthropic({ apiKey: anthropicKey })
+  : null;
+
+if (anthropic) {
+  console.log('✅ Anthropic API initialized');
+} else {
+  console.log('⚠️ ANTHROPIC_KEY or ANTHROPIC_API_KEY not found - Santa Chat will be disabled');
+}
 
 const app = express();
 app.use(cors());
@@ -1103,95 +1116,136 @@ app.post('/api/analyze-all', async (req, res) => {
     const sources = {};
     let primaryUser = null;
     
-    // Check for demo data
+    // Check for cached Twitter data as fallback
     const cachedData = CACHED_REAL_DATA[cleanUsername.toLowerCase()];
-    const demoData = DEMO_MULTI_SOURCE[cleanUsername.toLowerCase()];
-    const useDemo = !!cachedData && !!demoData;
     
-    if (useDemo) {
-      console.log('🎭 Using demo data for known user...');
+    // 1. TWITTER - Try real APIs first, fall back to cached data
+    console.log('\n📱 Checking Twitter...');
+    let tweets = [];
+    let twitterUser = null;
+    
+    // Try Nitter first (free, no API key needed)
+    console.log('   📡 Trying Nitter...');
+    const nitterResult = await fetchNitterTweets(cleanUsername);
+    
+    if (nitterResult.tweets.length > 0) {
+      tweets = nitterResult.tweets;
+      twitterUser = {
+        username: cleanUsername,
+        name: cleanUsername,
+        profileImage: `https://unavatar.io/twitter/${cleanUsername}`,
+        description: `@${cleanUsername} on Twitter/X`,
+        followers: '—',
+        following: '—',
+        tweets: tweets.length
+      };
+      console.log(`   ✅ Got ${tweets.length} tweets from Nitter (${nitterResult.instance})`);
+    } else {
+      // Try Twitter API as fallback
+      console.log('   📡 Nitter failed, trying Twitter API...');
+      try {
+        const client = await initTwitterClient();
+        if (client) {
+          const searchResult = await client.v2.search(`from:${cleanUsername}`, {
+            max_results: 100,
+            'tweet.fields': ['created_at', 'public_metrics', 'text', 'author_id'],
+            'expansions': ['author_id'],
+            'user.fields': ['profile_image_url', 'description', 'public_metrics', 'name', 'username']
+          });
+          
+          if (searchResult.data?.data && searchResult.data.data.length > 0) {
+            tweets = searchResult.data.data;
+            const authorInfo = searchResult.includes?.users?.[0];
+            twitterUser = {
+              username: authorInfo?.username || cleanUsername,
+              name: authorInfo?.name || cleanUsername,
+              profileImage: authorInfo?.profile_image_url?.replace('_normal', '_400x400') || `https://unavatar.io/twitter/${cleanUsername}`,
+              description: authorInfo?.description || '',
+              followers: authorInfo?.public_metrics?.followers_count || 0,
+              following: authorInfo?.public_metrics?.following_count || 0,
+              tweets: authorInfo?.public_metrics?.tweet_count || tweets.length
+            };
+            console.log(`   ✅ Got ${tweets.length} tweets from Twitter API`);
+          }
+        }
+      } catch (err) {
+        console.log(`   ❌ Twitter API failed: ${err.message}`);
+      }
     }
     
-    // 1. TWITTER (use cached data, no new API calls)
-    console.log('\n📱 Checking Twitter...');
-    if (cachedData) {
-      const twitterAnalysis = analyzeTweets(cachedData.tweets);
+    // Fall back to cached data if real APIs failed
+    if (tweets.length === 0 && cachedData) {
+      console.log('   📦 Using cached Twitter data...');
+      tweets = cachedData.tweets;
+      twitterUser = { username: cleanUsername, ...cachedData.user };
+    }
+    
+    if (tweets.length > 0) {
+      const twitterAnalysis = analyzeTweets(tweets);
       sources.twitter = {
         ...twitterAnalysis,
         found: true
       };
-      primaryUser = { username: cleanUsername, ...cachedData.user };
-      console.log(`   ✅ Twitter: ${twitterAnalysis.score}/100 (${twitterAnalysis.verdict})`);
+      primaryUser = twitterUser;
+      console.log(`   📊 Twitter Score: ${twitterAnalysis.score}/100 (${twitterAnalysis.verdict})`);
     } else {
-      console.log(`   ⚠️ Twitter: No cached data for @${cleanUsername}`);
-      sources.twitter = { found: false, score: 50 };
+      console.log(`   ⚠️ Twitter: No data found for @${cleanUsername}`);
+      sources.twitter = { found: false };
+      // Still set a basic user profile
+      primaryUser = {
+        username: cleanUsername,
+        name: cleanUsername,
+        profileImage: `https://unavatar.io/twitter/${cleanUsername}`,
+        description: `@${cleanUsername}`,
+        followers: '—',
+        following: '—',
+        tweets: '—'
+      };
     }
     
-    // 2. REDDIT
+    // 2. REDDIT - Always use real API
     console.log('\n🔴 Checking Reddit...');
-    if (useDemo && demoData.reddit) {
-      // Use demo data for Reddit
-      sources.reddit = { ...demoData.reddit };
-      console.log(`   ✅ Reddit (demo): ${demoData.reddit.score}/100 (${demoData.reddit.verdict})`);
+    const redditData = await fetchRedditData(cleanUsername);
+    if (redditData.found && redditData.comments.length > 0) {
+      const redditAnalysis = analyzeRedditComments(redditData.comments);
+      sources.reddit = {
+        ...redditAnalysis,
+        found: true
+      };
+      console.log(`   ✅ Reddit: ${redditAnalysis.score}/100 (${redditAnalysis.verdict})`);
     } else {
-      const redditData = await fetchRedditData(cleanUsername);
-      if (redditData.found && redditData.comments.length > 0) {
-        const redditAnalysis = analyzeRedditComments(redditData.comments);
-        sources.reddit = {
-          ...redditAnalysis,
-          found: true
-        };
-        console.log(`   ✅ Reddit: ${redditAnalysis.score}/100 (${redditAnalysis.verdict})`);
-      } else {
-        console.log(`   ⚠️ Reddit: User u/${cleanUsername} not found`);
-        sources.reddit = { found: false };
-      }
+      console.log(`   ⚠️ Reddit: User u/${cleanUsername} not found`);
+      sources.reddit = { found: false };
     }
     
-    // 3. NEWS (DuckDuckGo)
+    // 3. NEWS (DuckDuckGo) - Always use real API
     console.log('\n📰 Checking News...');
-    if (useDemo && demoData.news) {
-      // Use demo data for News
-      sources.news = { ...demoData.news };
-      console.log(`   ✅ News (demo): ${demoData.news.score}/100 (${demoData.news.verdict})`);
+    const newsData = await fetchNewsData(cleanUsername);
+    if (newsData.found && newsData.snippets.length > 0) {
+      const newsAnalysis = analyzeNewsSnippets(newsData.snippets);
+      sources.news = {
+        ...newsAnalysis,
+        found: true
+      };
+      console.log(`   ✅ News: ${newsAnalysis.score}/100 (${newsAnalysis.verdict})`);
     } else {
-      const newsData = await fetchNewsData(cleanUsername);
-      if (newsData.found && newsData.snippets.length > 0) {
-        const newsAnalysis = analyzeNewsSnippets(newsData.snippets);
-        sources.news = {
-          ...newsAnalysis,
-          found: true
-        };
-        console.log(`   ✅ News: ${newsAnalysis.score}/100 (${newsAnalysis.verdict})`);
-      } else {
-        console.log(`   ⚠️ News: No news found for "${cleanUsername}"`);
-        sources.news = { found: false };
-      }
+      console.log(`   ⚠️ News: No news found for "${cleanUsername}"`);
+      sources.news = { found: false };
     }
     
-    // 4. GITHUB
+    // 4. GITHUB - Always use real API
     console.log('\n🐙 Checking GitHub...');
-    if (useDemo && demoData.github) {
-      // Use demo data for GitHub
-      sources.github = { ...demoData.github };
-      if (demoData.github.found) {
-        console.log(`   ✅ GitHub (demo): ${demoData.github.score}/100 (${demoData.github.verdict})`);
-      } else {
-        console.log(`   ⚠️ GitHub: User ${cleanUsername} not found`);
-      }
+    const githubData = await fetchGitHubData(cleanUsername);
+    if (githubData.found) {
+      const githubAnalysis = analyzeGitHubData(githubData);
+      sources.github = {
+        ...githubAnalysis,
+        found: true
+      };
+      console.log(`   ✅ GitHub: ${githubAnalysis.score}/100 (${githubAnalysis.verdict})`);
     } else {
-      const githubData = await fetchGitHubData(cleanUsername);
-      if (githubData.found) {
-        const githubAnalysis = analyzeGitHubData(githubData);
-        sources.github = {
-          ...githubAnalysis,
-          found: true
-        };
-        console.log(`   ✅ GitHub: ${githubAnalysis.score}/100 (${githubAnalysis.verdict})`);
-      } else {
-        console.log(`   ⚠️ GitHub: User ${cleanUsername} not found`);
-        sources.github = { found: false };
-      }
+      console.log(`   ⚠️ GitHub: User ${cleanUsername} not found`);
+      sources.github = { found: false };
     }
     
     // Calculate weighted score
@@ -1202,17 +1256,29 @@ app.post('/api/analyze-all', async (req, res) => {
     console.log(`📊 Sources analyzed: ${result.sourcesFound}/4`);
     console.log(`========================================\n`);
     
-    // If no primary user, create one
+    // If no primary user from Twitter, try to get info from GitHub or create generic
     if (!primaryUser) {
-      primaryUser = {
-        username: cleanUsername,
-        name: cleanUsername,
-        profileImage: `https://unavatar.io/${cleanUsername}`,
-        description: `Multi-platform analysis for ${cleanUsername}`,
-        followers: '—',
-        following: '—',
-        tweets: '—'
-      };
+      if (sources.github?.found && githubData?.user) {
+        primaryUser = {
+          username: cleanUsername,
+          name: githubData.user.name || cleanUsername,
+          profileImage: githubData.user.avatar_url || `https://unavatar.io/${cleanUsername}`,
+          description: githubData.user.bio || `Multi-platform analysis for ${cleanUsername}`,
+          followers: githubData.user.followers || '—',
+          following: githubData.user.following || '—',
+          tweets: '—'
+        };
+      } else {
+        primaryUser = {
+          username: cleanUsername,
+          name: cleanUsername,
+          profileImage: `https://unavatar.io/${cleanUsername}`,
+          description: `Multi-platform analysis for ${cleanUsername}`,
+          followers: '—',
+          following: '—',
+          tweets: '—'
+        };
+      }
     }
     
     res.json({
@@ -1227,6 +1293,129 @@ app.post('/api/analyze-all', async (req, res) => {
   } catch (error) {
     console.error('Multi-source analysis error:', error);
     res.status(500).json({ error: 'Failed to analyze user. Please try again.' });
+  }
+});
+
+// ==========================================
+// SANTA CHAT API - Claude-powered analysis
+// ==========================================
+app.post('/api/santa-chat', async (req, res) => {
+  try {
+    const { username, message, conversationHistory = [] } = req.body;
+    
+    if (!anthropic) {
+      return res.status(500).json({ 
+        error: 'Santa Chat is not available. Please add ANTHROPIC_KEY=your-api-key to your .env file and restart the server!' 
+      });
+    }
+    
+    if (!username && !message) {
+      return res.status(400).json({ error: 'Please provide a username or message' });
+    }
+    
+    console.log(`\n🎅 SANTA CHAT: Analyzing @${username || 'conversation'}`);
+    
+    let twitterData = null;
+    let tweets = [];
+    
+    // If a username is provided, fetch their Twitter data
+    if (username) {
+      const cleanUsername = username.replace('@', '').trim();
+      
+      // Check cached data first
+      const cachedData = CACHED_REAL_DATA[cleanUsername.toLowerCase()];
+      if (cachedData) {
+        tweets = cachedData.tweets;
+        twitterData = cachedData.user;
+      } else {
+        // Try Nitter
+        const nitterResult = await fetchNitterTweets(cleanUsername);
+        if (nitterResult.tweets.length > 0) {
+          tweets = nitterResult.tweets;
+          twitterData = {
+            username: cleanUsername,
+            name: cleanUsername,
+            profileImage: `https://unavatar.io/twitter/${cleanUsername}`
+          };
+        }
+      }
+    }
+    
+    // Build the system prompt for Santa
+    const systemPrompt = `You are Santa Claus, reviewing social media behavior for the Naughty/Nice list. You speak with warmth but also brutal honesty. You have a great sense of humor and don't hold back your observations.
+
+When given a Twitter username and their tweets, you analyze their online persona and classify them into one or more of these categories:
+
+🚽 **SHIT POSTER** - Posts chaotic, unhinged, or deliberately provocative content for laughs
+🤡 **REPLY GUY** - Constantly replies to famous accounts hoping for engagement
+🧠 **BRAIN ROT** - TikTok brain, incoherent zoomer humor, terminally online
+📢 **CLOUT CHASER** - Does anything for likes and followers
+😤 **RAGE BAITER** - Posts inflammatory takes to get engagement
+🤓 **THOUGHT LEADER** - Posts pretentious "insights" and threads
+💀 **EDGELORD** - Tries too hard to be offensive or cool
+😇 **WHOLESOME** - Genuinely nice, supportive, positive vibes
+🏗️ **BUILDER** - Actually creates things and shares genuine work
+📚 **LURKER** - Barely posts, just watches the chaos
+
+Your responses should be:
+1. Start with a festive greeting
+2. Give them a VIBE CHECK with their primary classification(s)
+3. Provide specific observations from their tweets with quotes when relevant
+4. End with a VERDICT: NAUGHTY or NICE (be honest!)
+5. Give them a score out of 100 on the Nice-O-Meter
+
+Be funny, sarcastic when appropriate, but also genuine. Use Christmas puns. Reference coal and presents.
+
+If no tweets are available, just have a fun chat as Santa about social media behavior!`;
+
+    // Build messages for Claude
+    const messages = [];
+    
+    // Add conversation history
+    conversationHistory.forEach(msg => {
+      messages.push({
+        role: msg.role,
+        content: msg.content
+      });
+    });
+    
+    // Add current message
+    let userMessage = message || '';
+    
+    if (username && tweets.length > 0) {
+      const tweetSummary = tweets.slice(0, 15).map((t, i) => `${i + 1}. "${t.text}"`).join('\n');
+      userMessage = `Please analyze Twitter user @${username}. Here are their recent tweets:\n\n${tweetSummary}\n\nGive me the full Santa scorecard on this person!`;
+    } else if (username && tweets.length === 0) {
+      userMessage = `I want you to analyze @${username} but I couldn't find any tweets. Just give me a funny made-up assessment based on their username!`;
+    }
+    
+    messages.push({
+      role: 'user',
+      content: userMessage
+    });
+    
+    // Call Claude
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1024,
+      system: systemPrompt,
+      messages: messages
+    });
+    
+    const assistantMessage = response.content[0].text;
+    
+    console.log('✅ Santa has spoken!');
+    
+    res.json({
+      message: assistantMessage,
+      username: username || null,
+      twitterData: twitterData,
+      tweetsFound: tweets.length
+    });
+    
+  } catch (error) {
+    console.error('Santa Chat error:', error);
+    res.status(500).json({ error: 'Santa is taking a cookie break. Please try again!' });
   }
 });
 
